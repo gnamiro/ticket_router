@@ -13,6 +13,9 @@ import json
 import re
 from pydantic import ValidationError
 
+from policy import should_review
+
+
 
 
 
@@ -236,18 +239,63 @@ def router_node(state: TicketState) -> TicketState:
     return state
 
 
+# Human review node (if needed based on policy)
+def human_review_node(state: TicketState) -> TicketState:
+    state["needs_review"] = True
+    state["review_reason"] = state.get("review_reason", "Low confidence / uncertain output")
+    state["route_to"] = "triage_queue"
+    state["handler_level"] = "specialist"
+    state["routing_reason"] = f"Pending human review: {state['review_reason']}"
+    add_event(state, "human_review", "Routed to triage pending human review", {})
+    return state
+
+CONF_MIN = 0.7
+
+def after_classify(state: TicketState) -> str:
+    conf = float(state.get("category_confidence", 0.0))
+    if conf < CONF_MIN:
+        state["review_reason"] = f"Low category confidence ({conf:.2f} < {CONF_MIN:.2f})"
+        return "human_review"
+    return "urgency"
+
+def after_urgency(state: TicketState) -> str:
+    score = float(state.get("urgency_score", 0.0))
+    if score < 0.2 and "down" in state.get("content","").lower():
+        state["review_reason"] = "Urgency seems inconsistent with ticket text"
+        return "human_review"
+    return "route"
+
+
 def build_graph():
     g = StateGraph(TicketState)
 
     g.add_node("classify", classifier_node)
+    g.add_node("human_review", human_review_node)
     g.add_node("urgency", urgency_node)
     g.add_node("route", router_node)
 
-    # Edges: START -> classify -> urgency -> route -> END
     g.add_edge(START, "classify")
-    g.add_edge("classify", "urgency")
+
+    # Conditional: after classify -> either human_review OR urgency
+    g.add_conditional_edges(
+        "classify",
+        after_classify,
+        {
+            "human_review": "human_review",
+            "urgency": "urgency",
+        },
+    )
+
+    # If human review is needed, stop (or you can continue to route triage explicitly)
+    g.add_edge("human_review", END)
+
+    g.add_conditional_edges("urgency", after_urgency, {"human_review":"human_review", "route":"route"})
+
+
+    # Normal path
     g.add_edge("urgency", "route")
     g.add_edge("route", END)
+
     return g.compile()
 
 def new_state(
@@ -266,3 +314,26 @@ def new_state(
         "events": [],
         "errors": [],
     }
+
+
+def review_gate(state: TicketState) -> str:
+    needs, reason = should_review(state)
+    state["needs_review"] = needs
+    state["review_reason"] = reason
+    add_event(state, "gate", "Review gate evaluated", {"needs_review": needs, "reason": reason})
+    return "human_review" if needs else "route"
+
+def human_review_node(state: TicketState) -> TicketState:
+    """
+    Production version:
+      - create a review task in your ticketing system (Jira/Zendesk)
+      - store task id in state
+      - stop processing until human responds
+    For now:
+      - mark as pending review and route to triage
+    """
+    state["route_to"] = "triage_queue"
+    state["handler_level"] = "specialist"
+    state["routing_reason"] = f"Pending human review: {state.get('review_reason','')}"
+    add_event(state, "human_review", "Routed to triage pending human review", {})
+    return state
