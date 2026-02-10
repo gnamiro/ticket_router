@@ -1,5 +1,7 @@
 langgraph
 langchain
 langchain-openai
+langchain-community
 pydantic
 python-dotenv
+langchain-ollama
